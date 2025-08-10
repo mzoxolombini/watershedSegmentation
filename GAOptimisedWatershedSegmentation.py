@@ -8,11 +8,9 @@ import shutil
 import socket
 import threading
 from contextlib import contextmanager
-from functools import partial
-import multiprocessing
-
 import numpy as np
 import matplotlib.pyplot as plt
+import seaborn as sns
 from scipy.io import loadmat
 from skimage.transform import resize
 from sklearn.decomposition import PCA
@@ -35,10 +33,12 @@ memory = Memory(location='cache_dir', verbose=0)
 CONFIG = {
     'datasets': ['IndianPines', 'Salinas', 'PaviaU'],
     'ga_params': {
-        'population_size': 5,
-        'generations': 5,
-        'parents_mating': 2,
-        'timeout': 14400,  # seconds
+        'population_size': 15,
+        'generations': 50,  # Max generations
+        'parents_mating': 5,
+        'mutation_percent_genes': 20,
+        'saturate_generations': 10, # Early stopping patience
+        'timeout': 14400,
     },
     'downsample_factor': 2,
     'watershed_params': {
@@ -56,24 +56,16 @@ CONFIG = {
 # This dictionary allows tuning the fitness function for each dataset's unique characteristics.
 DATASET_FITNESS_CONFIG = {
     'IndianPines': {
-        'w_smoothness': 0.20,  # High penalty for fragmentation in this relatively simple scene
-        'target_regions': 1500,  # Expect fewer regions for agricultural fields
-        'min_coverage_pct': 0.10
+        'w_smoothness': 0.20, 'target_regions': 1500, 'min_coverage_pct': 0.10
     },
     'Salinas': {
-        'w_smoothness': 0.15,  # Standard penalty
-        'target_regions': 2000,  # Similar to Indian Pines
-        'min_coverage_pct': 0.10
+        'w_smoothness': 0.15, 'target_regions': 2000, 'min_coverage_pct': 0.10
     },
     'PaviaU': {
-        'w_smoothness': 0.10,  # Lower penalty, as urban scenes are naturally fragmented
-        'target_regions': 4000,  # Allow for many more regions due to complex urban objects
-        'min_coverage_pct': 0.05  # Lower coverage threshold might be needed
+        'w_smoothness': 0.05, 'target_regions': 6000, 'min_coverage_pct': 0.02
     },
     'default': {
-        'w_smoothness': 0.15,
-        'target_regions': 2000,
-        'min_coverage_pct': 0.10
+        'w_smoothness': 0.15, 'target_regions': 2000, 'min_coverage_pct': 0.10
     }
 }
 
@@ -86,16 +78,13 @@ ssl._create_default_https_context = ssl._create_unverified_context
 
 
 def setup_cache():
+    CACHE_DIR = 'watershed_cache'
     if os.path.exists(CACHE_DIR):
-        try:
-            shutil.rmtree(CACHE_DIR)
+        try: shutil.rmtree(CACHE_DIR)
         except OSError as e:
-            if e.errno != errno.ENOENT:
-                print(f"Warning: Could not clear cache directory {CACHE_DIR}: {e}")
-    try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-    except OSError as e:
-        print(f"Warning: Could not create cache directory {CACHE_DIR}: {e}")
+            if e.errno != errno.ENOENT: print(f"Warning: Could not clear cache directory {CACHE_DIR}: {e}")
+    try: os.makedirs(CACHE_DIR, exist_ok=True)
+    except OSError as e: print(f"Warning: Could not create cache directory {CACHE_DIR}: {e}")
 
 
 setup_cache()
@@ -342,18 +331,16 @@ def cached_decode_particle_with_pca(particle_tuple, pca_img, image, gt, classifi
 # ========== GLOBAL EVAL ARGS for GA (picklable) ============
 GLOBAL_EVAL_ARGS = {}
 
-
 # ====== GA FITNESS WRAPPER (ADAPTIVE) ========
 def ga_fitness_wrapper(ga_instance, solution, solution_idx):
     """
-    An adaptive fitness function that uses dataset-specific parameters
-    to balance accuracy, coverage, and spatial smoothness.
+    PyGAD-compatible fitness function.
+    Uses a blend of OA and AA as base score, with dataset-specific penalties.
     """
     args = GLOBAL_EVAL_ARGS
     if not args:
         return 0.0
 
-    # Get the specific configuration for the current dataset
     dataset_name = args.get('dataset_name', 'default')
     cfg = DATASET_FITNESS_CONFIG.get(dataset_name, DATASET_FITNESS_CONFIG['default'])
 
@@ -369,36 +356,41 @@ def ga_fitness_wrapper(ga_instance, solution, solution_idx):
             conf_thresh=CONFIG['watershed_params']['conf_thresh'],
             dilation_radius=CONFIG['watershed_params']['dilation_radius']
         )
-        metrics = evaluate(args['gt'], class_map)
-        base_fitness = metrics.get('AA', 0.0)
 
-        # --- Penalty Calculations with dataset-specific parameters ---
-        # Coverage Penalty
+        metrics = evaluate(args['gt'], class_map)
+        oa = metrics.get('OA', 0.0)
+        aa = metrics.get('AA', 0.0)
+
+        # Base fitness is a blend of OA and AA
+        alpha = 0.55  # Weight for OA
+        beta = 0.45   # Weight for AA
+        base_fitness = alpha * oa + beta * aa
+
+        # Coverage penalty
         labeled_pixel_count = np.count_nonzero(class_map)
         total_pixels_in_gt = np.count_nonzero(args['gt_mask'])
-        coverage_ratio = labeled_pixel_count / total_pixels_in_gt if total_pixels_in_gt > 0 else 0
-
+        coverage_ratio = labeled_pixel_count / total_pixels_in_gt if total_pixels_in_gt > 0 else 0.0
         coverage_penalty = 0.0
         if coverage_ratio < min_coverage_pct:
-            coverage_penalty = 0.3 * (1 - coverage_ratio / min_coverage_pct)
+            coverage_penalty = 0.5 * (1.0 - (coverage_ratio / (min_coverage_pct + 1e-12)))
 
-        # Smoothness Penalty
-        num_regions = len(np.unique(class_map)) - 1
+        # Smoothness penalty
+        num_regions = int(len(np.unique(class_map)) - (1 if 0 in np.unique(class_map) else 0))
         smoothness_penalty = 0.0
         if num_regions > target_regions:
-            excess_ratio = (num_regions - target_regions) / target_regions
-            smoothness_penalty = w_smoothness * excess_ratio
+            excess_ratio = (num_regions - target_regions) / (target_regions + 1e-12)
+            smoothness_penalty = min(0.6, w_smoothness * excess_ratio)
 
         final_fitness = base_fitness - coverage_penalty - smoothness_penalty
-        return max(0.0, final_fitness)
+        return float(max(0.0, min(1.0, final_fitness)))
 
     except Exception as e:
         print(f"GA fitness eval error: {e}")
         return 0.0
 
-
 # ================== OPTIMIZED WATERSHED GA ==================
 class WatershedGAOptimizer:
+    # __init__, decode_particle, evaluate_segmentation are unchanged
     def __init__(self, image, ground_truth, dataset_name):
         print(f"[Init] Initializing GA optimizer for {dataset_name}...")
         self.image = image
@@ -429,67 +421,61 @@ class WatershedGAOptimizer:
             clf.fit(X, y)
 
     def decode_particle(self, particle):
+        # This function is unchanged
         return cached_decode_particle_with_pca(tuple(particle), self.pca_img, self.image, self.gt,
                                                self.classifiers, self.scaler, self.gt_mask, self.h, self.w,
                                                conf_thresh=CONFIG['watershed_params']['conf_thresh'],
                                                dilation_radius=CONFIG['watershed_params']['dilation_radius'])
 
     def evaluate_segmentation(self, class_map):
+        # This function is unchanged
         return evaluate(self.gt, class_map)
 
     def optimize(self):
         print(f"[Optimize] Starting GA for {self.dataset_name} dataset...")
         global GLOBAL_EVAL_ARGS
         GLOBAL_EVAL_ARGS = {
-            'pca_img': self.pca_img,
-            'image': self.image,
-            'gt': self.gt,
-            'classifiers': self.classifiers,
-            'scaler': self.scaler,
-            'gt_mask': self.gt_mask,
-            'h': self.h,
-            'w': self.w,
-            'dataset_name': self.dataset_name  # Pass dataset name to fitness function
+            'pca_img': self.pca_img, 'image': self.image, 'gt': self.gt,
+            'classifiers': self.classifiers, 'scaler': self.scaler, 'gt_mask': self.gt_mask,
+            'h': self.h, 'w': self.w, 'dataset_name': self.dataset_name
         }
+
+        gene_space = [
+            {'low': 1, 'high': self.pca_img.shape[2], 'step': 1},
+            {'low': 0.1, 'high': 5},
+            {'low': 0.01, 'high': 0.99},
+            {'low': 10, 'high': 500, 'step': 1},
+            {'low': 0, 'high': 2, 'step': 1}
+        ]
 
         ga_instance = pygad.GA(
             num_generations=CONFIG['ga_params']['generations'],
             num_parents_mating=CONFIG['ga_params']['parents_mating'],
-            fitness_func=ga_fitness_wrapper,
+            fitness_func=ga_fitness_wrapper, # This now matches the required signature
             sol_per_pop=CONFIG['ga_params']['population_size'],
-            num_genes=5,
-            gene_space=[
-                {'low': 1, 'high': self.pca_img.shape[2], 'step': 1},
-                {'low': 0.1, 'high': 5},
-                {'low': 0.01, 'high': 0.99},
-                {'low': 1, 'high': 500, 'step': 1},
-                {'low': 0, 'high': 2, 'step': 1}
-            ],
+            num_genes=len(gene_space),
+            gene_space=gene_space,
+            mutation_percent_genes=CONFIG['ga_params']['mutation_percent_genes'],
             parent_selection_type="sss",
             crossover_type="single_point",
             mutation_type="random",
-            mutation_percent_genes=20,
-            stop_criteria=f"saturate_{CONFIG['ga_params']['generations']}"
+            stop_criteria=[f"saturate_{CONFIG['ga_params']['saturate_generations']}"]
         )
 
         try:
-            with time_limit(CONFIG['ga_params']['timeout']):
-                ga_instance.run()
-
-            best_solution, best_solution_fitness, _ = ga_instance.best_solution()
-            print(
-                f"[Result] Best solution for {self.dataset_name}: {best_solution} with fitness: {best_solution_fitness}")
+            ga_instance.run()
+            best_solution, best_fitness, _ = ga_instance.best_solution()
+            print(f"[Result] Best solution from GA: {best_solution} with fitness: {best_fitness:.4f}")
+            # ... (Local search and final evaluation)
             final_seg = self.decode_particle(best_solution)
             final_metrics = self.evaluate_segmentation(final_seg)
             print(f"[Done] Optimization completed for {self.dataset_name}.")
-            return best_solution, final_seg, final_metrics
+            return best_solution, final_seg, final_metrics, ga_instance
 
-        except TimeoutException as e:
-            print(f"GA for {self.dataset_name} timed out: {e}")
-            return None, None, None
+
         except Exception as e:
             print(f"Error during GA optimization for {self.dataset_name}: {e}")
-            return None, None, None
+            return None, None, None, None
 
 
 # ================== VISUALIZATION ==================
