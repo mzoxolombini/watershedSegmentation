@@ -53,7 +53,6 @@ CONFIG = {
 }
 
 # ================== DATASET-SPECIFIC FITNESS CONFIG ==================
-# This dictionary allows tuning the fitness function for each dataset's unique characteristics.
 DATASET_FITNESS_CONFIG = {
     'IndianPines': {
         'w_smoothness': 0.20, 'target_regions': 1500, 'min_coverage_pct': 0.10
@@ -85,13 +84,47 @@ def setup_cache():
             if e.errno != errno.ENOENT: print(f"Warning: Could not clear cache directory {CACHE_DIR}: {e}")
     try: os.makedirs(CACHE_DIR, exist_ok=True)
     except OSError as e: print(f"Warning: Could not create cache directory {CACHE_DIR}: {e}")
-
-
 setup_cache()
-memory = Memory(CACHE_DIR, verbose=0)
 
-socket.setdefaulttimeout(30)
-ssl._create_default_https_context = ssl._create_unverified_context
+@memory.cache
+def cached_decode_particle_with_pca(particle_tuple, pca_img, image, gt, classifiers, scaler, gt_mask, h, w,
+                                    conf_thresh=0.60, dilation_radius=3):
+    try:
+        particle = np.array(particle_tuple)
+        pca_components = max(1, min(pca_img.shape[2], int(round(particle[0]))))
+        sigma = max(0.1, min(5, float(particle[1])))
+        thresh = max(0.01, min(0.99, float(particle[2])))
+        min_size = max(1, min(500, int(round(particle[3]))))
+        classifier_idx = min(2, max(0, int(round(particle[4]))))
+        use_pca_img = pca_img[..., :pca_components]
+        cleaned_labels = segment_and_postprocess_hsi_using_pca_img(
+            use_pca_img, gt_mask, n_comp=pca_components, sigma=sigma, thresh=thresh,
+            marker_min_distance=3, min_size=min_size, connectivity=2
+        )
+        reshaped = image.reshape(-1, image.shape[-1])
+        img_2d_scaled = scaler.transform(reshaped)
+        clf_key = ['RF', 'SVM', 'KNN'][classifier_idx]
+        clf = classifiers[clf_key]
+        if hasattr(clf, "predict_proba"):
+            probs = clf.predict_proba(img_2d_scaled)
+            preds_flat = np.argmax(probs, axis=1)
+            maxp_flat = probs.max(axis=1)
+        else:
+            preds_flat = clf.predict(img_2d_scaled)
+            maxp_flat = np.zeros_like(preds_flat, dtype=float)
+        preds_flat = preds_flat.astype(np.int64) + 1
+        preds_2d = preds_flat.reshape(h, w)
+        proba_map = maxp_flat.reshape(h, w)
+        preds_2d[~gt_mask] = 0
+        proba_map[~gt_mask] = 0.0
+        refined_preds = refine_predictions_by_confidence(preds_2d, proba_map,
+                                                         conf_thresh=conf_thresh,
+                                                         dilation_radius=dilation_radius)
+        final_map = assign_region_labels_by_majority(cleaned_labels, refined_preds, background_mask=gt_mask)
+        return final_map
+    except Exception as e:
+        print(f"Error in cached_decode_particle_with_pca: {e}")
+        return np.zeros((h, w), dtype=int)
 
 
 # ================== TIMEOUT HANDLING ==================
@@ -333,13 +366,8 @@ GLOBAL_EVAL_ARGS = {}
 
 # ====== GA FITNESS WRAPPER (ADAPTIVE) ========
 def ga_fitness_wrapper(ga_instance, solution, solution_idx):
-    """
-    PyGAD-compatible fitness function.
-    Uses a blend of OA and AA as base score, with dataset-specific penalties.
-    """
     args = GLOBAL_EVAL_ARGS
-    if not args:
-        return 0.0
+    if not args: return 0.0
 
     dataset_name = args.get('dataset_name', 'default')
     cfg = DATASET_FITNESS_CONFIG.get(dataset_name, DATASET_FITNESS_CONFIG['default'])
@@ -361,12 +389,10 @@ def ga_fitness_wrapper(ga_instance, solution, solution_idx):
         oa = metrics.get('OA', 0.0)
         aa = metrics.get('AA', 0.0)
 
-        # Base fitness is a blend of OA and AA
-        alpha = 0.55  # Weight for OA
-        beta = 0.45   # Weight for AA
+        alpha = 0.55
+        beta = 0.45
         base_fitness = alpha * oa + beta * aa
 
-        # Coverage penalty
         labeled_pixel_count = np.count_nonzero(class_map)
         total_pixels_in_gt = np.count_nonzero(args['gt_mask'])
         coverage_ratio = labeled_pixel_count / total_pixels_in_gt if total_pixels_in_gt > 0 else 0.0
@@ -374,7 +400,6 @@ def ga_fitness_wrapper(ga_instance, solution, solution_idx):
         if coverage_ratio < min_coverage_pct:
             coverage_penalty = 0.5 * (1.0 - (coverage_ratio / (min_coverage_pct + 1e-12)))
 
-        # Smoothness penalty
         num_regions = int(len(np.unique(class_map)) - (1 if 0 in np.unique(class_map) else 0))
         smoothness_penalty = 0.0
         if num_regions > target_regions:
@@ -388,9 +413,37 @@ def ga_fitness_wrapper(ga_instance, solution, solution_idx):
         print(f"GA fitness eval error: {e}")
         return 0.0
 
+    def local_search_refinement(initial_solution, gene_space):
+        print("--- Starting Local Search Refinement ---")
+        current_solution = np.array(initial_solution)
+        current_fitness = ga_fitness_wrapper(None, current_solution, 0)
+        steps = 20
+        for step_num in range(steps):
+            best_neighbor, best_neighbor_fitness = current_solution, current_fitness
+            for i in range(len(current_solution)):
+                gene_info = gene_space[i]
+                low, high = gene_info['low'], gene_info['high']
+                step_size = 1 if 'step' in gene_info and gene_info['step'] == 1 else (high - low) * 0.02
+                for delta in [-step_size, step_size]:
+                    candidate = current_solution.copy()
+                    candidate[i] = np.clip(candidate[i] + delta, low, high)
+                    if 'step' in gene_info and gene_info['step'] == 1:
+                        candidate[i] = round(candidate[i])
+                    candidate_fitness = ga_fitness_wrapper(None, candidate, 0)
+                    if candidate_fitness > best_neighbor_fitness:
+                        best_neighbor, best_neighbor_fitness = candidate, candidate_fitness
+            if best_neighbor_fitness > current_fitness:
+                print(
+                    f"Local Search Step {step_num + 1}: Fitness improved from {current_fitness:.4f} to {best_neighbor_fitness:.4f}")
+                current_solution, current_fitness = best_neighbor, best_neighbor_fitness
+            else:
+                print("Local search converged. No further improvement found.")
+                break
+        print(f"--- Local Search Finished. Final Fitness: {current_fitness:.4f} ---")
+        return current_solution, current_fitness
+
 # ================== OPTIMIZED WATERSHED GA ==================
 class WatershedGAOptimizer:
-    # __init__, decode_particle, evaluate_segmentation are unchanged
     def __init__(self, image, ground_truth, dataset_name):
         print(f"[Init] Initializing GA optimizer for {dataset_name}...")
         self.image = image
@@ -420,17 +473,6 @@ class WatershedGAOptimizer:
             print(f"Training {name}...")
             clf.fit(X, y)
 
-    def decode_particle(self, particle):
-        # This function is unchanged
-        return cached_decode_particle_with_pca(tuple(particle), self.pca_img, self.image, self.gt,
-                                               self.classifiers, self.scaler, self.gt_mask, self.h, self.w,
-                                               conf_thresh=CONFIG['watershed_params']['conf_thresh'],
-                                               dilation_radius=CONFIG['watershed_params']['dilation_radius'])
-
-    def evaluate_segmentation(self, class_map):
-        # This function is unchanged
-        return evaluate(self.gt, class_map)
-
     def optimize(self):
         print(f"[Optimize] Starting GA for {self.dataset_name} dataset...")
         global GLOBAL_EVAL_ARGS
@@ -439,7 +481,6 @@ class WatershedGAOptimizer:
             'classifiers': self.classifiers, 'scaler': self.scaler, 'gt_mask': self.gt_mask,
             'h': self.h, 'w': self.w, 'dataset_name': self.dataset_name
         }
-
         gene_space = [
             {'low': 1, 'high': self.pca_img.shape[2], 'step': 1},
             {'low': 0.1, 'high': 5},
@@ -447,7 +488,6 @@ class WatershedGAOptimizer:
             {'low': 10, 'high': 500, 'step': 1},
             {'low': 0, 'high': 2, 'step': 1}
         ]
-
         ga_instance = pygad.GA(
             num_generations=CONFIG['ga_params']['generations'],
             num_parents_mating=CONFIG['ga_params']['parents_mating'],
@@ -461,30 +501,22 @@ class WatershedGAOptimizer:
             mutation_type="random",
             stop_criteria=[f"saturate_{CONFIG['ga_params']['saturate_generations']}"]
         )
-
         try:
+            # ## FIXED: Removed erroneous GA call ##
             ga_instance.run()
 
             best_solution, best_fitness, _ = ga_instance.best_solution()
             print(f"[Result] Best solution from GA: {best_solution} with fitness: {best_fitness:.4f}")
 
-            # Refine the best solution with a local search
             refined_solution, refined_fitness = local_search_refinement(best_solution, gene_space)
 
-            final_seg = self.decode_particle(refined_solution)
-            final_metrics = self.evaluate_segmentation(final_seg)
+            final_seg = cached_decode_particle_with_pca(tuple(refined_solution), **GLOBAL_EVAL_ARGS)
+            final_metrics = evaluate(self.gt, final_seg)
             print(f"[Done] Optimization completed for {self.dataset_name}.")
 
-            # SUCCESS PATH: Returns 4 values
             return refined_solution, final_seg, final_metrics, ga_instance
-
-        except TimeoutException as e:
-            print(f"GA for {self.dataset_name} timed out: {e}")
-            # FAILURE PATH: Must also return 4 values
-            return None, None, None, None
         except Exception as e:
             print(f"Error during GA optimization for {self.dataset_name}: {e}")
-            # FAILURE PATH: Must also return 4 values
             return None, None, None, None
 
 
@@ -521,13 +553,17 @@ def process_dataset(name, config):
     img, gt = load_dataset(name, downsample_factor=config['downsample_factor'])
     img = (img - img.min()) / (img.max() - img.min())
     optimizer = WatershedGAOptimizer(img, gt, name)
-    params, seg, metrics = optimizer.optimize()
+
+    # ## FIXED: Unpack all 4 values correctly ##
+    params, seg, metrics, ga_instance = optimizer.optimize()
+
     if metrics:
         print("\nPerformance Metrics:")
         for metric, value in metrics.items():
             if metric != 'Confusion':
                 print(f"{metric:>10}: {value:.4f}")
-        visualize_results(img, gt, seg, metrics)
+        # Pass ga_instance to the detailed visualization function
+        visualize_detailed_results(img, gt, seg, metrics, ga_instance, name)
     return metrics
 
 
@@ -541,10 +577,11 @@ if __name__ == "__main__":
             print(f"Error processing {name}: {str(e)}")
     print("\nFinal Results Across Datasets:")
     print(f"{'Dataset':<12} {'OA':>8} {'AA':>8} {'Kappa':>8} {'Dice':>8} {'IoU':>8}")
-    for name, metrics in results.items():
-        if metrics:
-            print(
-                f"{name:<12} {metrics['OA']:8.4f} {metrics['AA']:8.4f} {metrics['Kappa']:8.4f} {metrics['Dice']:8.4f} {metrics['IoU']:8.4f}")
+    if results:
+        for name, metrics in results.items():
+            if metrics:
+                print(
+                    f"{name:<12} {metrics['OA']:8.4f} {metrics['AA']:8.4f} {metrics['Kappa']:8.4f} {metrics['Dice']:8.4f} {metrics['IoU']:8.f}")
     try:
         shutil.rmtree(CACHE_DIR)
     except OSError as e:
