@@ -400,35 +400,6 @@ def ga_fitness_wrapper(ga_instance, solution, solution_idx):
         print(f"GA fitness eval error: {e}")
         return 0.0
 
-    def local_search_refinement(initial_solution, gene_space):
-        print("--- Starting Local Search Refinement ---")
-        current_solution = np.array(initial_solution)
-        current_fitness = ga_fitness_wrapper(None, current_solution, 0)
-        steps = 20
-        for step_num in range(steps):
-            best_neighbor, best_neighbor_fitness = current_solution, current_fitness
-            for i in range(len(current_solution)):
-                gene_info = gene_space[i]
-                low, high = gene_info['low'], gene_info['high']
-                step_size = 1 if 'step' in gene_info and gene_info['step'] == 1 else (high - low) * 0.02
-                for delta in [-step_size, step_size]:
-                    candidate = current_solution.copy()
-                    candidate[i] = np.clip(candidate[i] + delta, low, high)
-                    if 'step' in gene_info and gene_info['step'] == 1:
-                        candidate[i] = round(candidate[i])
-                    candidate_fitness = ga_fitness_wrapper(None, candidate, 0)
-                    if candidate_fitness > best_neighbor_fitness:
-                        best_neighbor, best_neighbor_fitness = candidate, candidate_fitness
-            if best_neighbor_fitness > current_fitness:
-                print(
-                    f"Local Search Step {step_num + 1}: Fitness improved from {current_fitness:.4f} to {best_neighbor_fitness:.4f}")
-                current_solution, current_fitness = best_neighbor, best_neighbor_fitness
-            else:
-                print("Local search converged. No further improvement found.")
-                break
-        print(f"--- Local Search Finished. Final Fitness: {current_fitness:.4f} ---")
-        return current_solution, current_fitness
-
 # ================== OPTIMIZED WATERSHED GA ==================
 class WatershedGAOptimizer:
     def __init__(self, image, ground_truth, dataset_name):
@@ -495,7 +466,7 @@ class WatershedGAOptimizer:
             best_solution, best_fitness, _ = ga_instance.best_solution()
             print(f"[Result] Best solution from GA: {best_solution} with fitness: {best_fitness:.4f}")
 
-            refined_solution, refined_fitness = local_search_refinement(best_solution, gene_space)
+            refined_solution, refined_fitness = self.local_search_refinement(best_solution, gene_space)
 
             final_seg = cached_decode_particle_with_pca(tuple(refined_solution), **GLOBAL_EVAL_ARGS)
             final_metrics = evaluate(self.gt, final_seg)
@@ -505,6 +476,34 @@ class WatershedGAOptimizer:
         except Exception as e:
             print(f"Error during GA optimization for {self.dataset_name}: {e}")
             return None, None, None, None
+
+    def local_search_refinement(self, initial_solution, gene_space):
+        print("--- Starting Local Search Refinement ---")
+        current_solution = np.array(initial_solution)
+        current_fitness = ga_fitness_wrapper(None, current_solution, 0)
+        steps = 20
+        for step_num in range(steps):
+            best_neighbor, best_neighbor_fitness = current_solution, current_fitness
+            for i in range(len(current_solution)):
+                gene_info = gene_space[i]
+                low, high = gene_info['low'], gene_info['high']
+                step_size = 1 if 'step' in gene_info and gene_info['step'] == 1 else (high - low) * 0.02
+                for delta in [-step_size, step_size]:
+                    candidate = current_solution.copy()
+                    candidate[i] = np.clip(candidate[i] + delta, low, high)
+                    if 'step' in gene_info and gene_info['step'] == 1:
+                        candidate[i] = round(candidate[i])
+                    candidate_fitness = ga_fitness_wrapper(None, candidate, 0)
+                    if candidate_fitness > best_neighbor_fitness:
+                        best_neighbor, best_neighbor_fitness = candidate, candidate_fitness
+            if best_neighbor_fitness > current_fitness:
+                print(f"Local Search Step {step_num + 1}: Fitness improved from {current_fitness:.4f} to {best_neighbor_fitness:.4f}")
+                current_solution, current_fitness = best_neighbor, best_neighbor_fitness
+            else:
+                print("Local search converged. No further improvement found.")
+                break
+        print(f"--- Local Search Finished. Final Fitness: {current_fitness:.4f} ---")
+        return current_solution, current_fitness
 
 
 # ================== VISUALIZATION ==================
@@ -548,7 +547,7 @@ def process_dataset(name, config):
         for metric, value in metrics.items():
             if metric != 'Confusion':
                 print(f"{metric:>10}: {value:.4f}")
-        visualize_detailed_results(img, gt, seg, metrics, ga_instance, name)
+        visualize_results(img, gt, seg, metrics)
     return metrics
 
 
