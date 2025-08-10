@@ -159,7 +159,6 @@ def time_limit(seconds):
         finally:
             signal.alarm(0)
 
-
 # ================== DATASET LOADING ==================
 @memory.cache
 def load_dataset(name='IndianPines', downsample_factor=2):
@@ -360,7 +359,6 @@ def cached_decode_particle_with_pca(particle_tuple, pca_img, image, gt, classifi
         print(f"Error in cached_decode_particle_with_pca: {e}")
         return np.zeros((h, w), dtype=int)
 
-
 # ========== GLOBAL EVAL ARGS for GA (picklable) ============
 GLOBAL_EVAL_ARGS = {}
 
@@ -369,29 +367,19 @@ def ga_fitness_wrapper(ga_instance, solution, solution_idx):
     args = GLOBAL_EVAL_ARGS
     if not args: return 0.0
 
-    dataset_name = args.get('dataset_name', 'default')
+    dataset_name = getattr(ga_instance, 'dataset_name', 'default')
     cfg = DATASET_FITNESS_CONFIG.get(dataset_name, DATASET_FITNESS_CONFIG['default'])
-
     w_smoothness = cfg['w_smoothness']
     target_regions = cfg['target_regions']
     min_coverage_pct = cfg['min_coverage_pct']
 
     try:
-        class_map = cached_decode_particle_with_pca(
-            tuple(solution),
-            args['pca_img'], args['image'], args['gt'], args['classifiers'],
-            args['scaler'], args['gt_mask'], args['h'], args['w'],
-            conf_thresh=CONFIG['watershed_params']['conf_thresh'],
-            dilation_radius=CONFIG['watershed_params']['dilation_radius']
-        )
-
+        class_map = cached_decode_particle_with_pca(tuple(solution), **args)
         metrics = evaluate(args['gt'], class_map)
         oa = metrics.get('OA', 0.0)
         aa = metrics.get('AA', 0.0)
 
-        alpha = 0.55
-        beta = 0.45
-        base_fitness = alpha * oa + beta * aa
+        base_fitness = 0.55 * oa + 0.45 * aa
 
         labeled_pixel_count = np.count_nonzero(class_map)
         total_pixels_in_gt = np.count_nonzero(args['gt_mask'])
@@ -408,7 +396,6 @@ def ga_fitness_wrapper(ga_instance, solution, solution_idx):
 
         final_fitness = base_fitness - coverage_penalty - smoothness_penalty
         return float(max(0.0, min(1.0, final_fitness)))
-
     except Exception as e:
         print(f"GA fitness eval error: {e}")
         return 0.0
@@ -479,7 +466,7 @@ class WatershedGAOptimizer:
         GLOBAL_EVAL_ARGS = {
             'pca_img': self.pca_img, 'image': self.image, 'gt': self.gt,
             'classifiers': self.classifiers, 'scaler': self.scaler, 'gt_mask': self.gt_mask,
-            'h': self.h, 'w': self.w, 'dataset_name': self.dataset_name
+            'h': self.h, 'w': self.w
         }
         gene_space = [
             {'low': 1, 'high': self.pca_img.shape[2], 'step': 1},
@@ -501,10 +488,10 @@ class WatershedGAOptimizer:
             mutation_type="random",
             stop_criteria=[f"saturate_{CONFIG['ga_params']['saturate_generations']}"]
         )
-        try:
-            # ## FIXED: Removed erroneous GA call ##
-            ga_instance.run()
+        ga_instance.dataset_name = self.dataset_name
 
+        try:
+            ga_instance.run()
             best_solution, best_fitness, _ = ga_instance.best_solution()
             print(f"[Result] Best solution from GA: {best_solution} with fitness: {best_fitness:.4f}")
 
@@ -554,7 +541,6 @@ def process_dataset(name, config):
     img = (img - img.min()) / (img.max() - img.min())
     optimizer = WatershedGAOptimizer(img, gt, name)
 
-    # ## FIXED: Unpack all 4 values correctly ##
     params, seg, metrics, ga_instance = optimizer.optimize()
 
     if metrics:
@@ -562,7 +548,6 @@ def process_dataset(name, config):
         for metric, value in metrics.items():
             if metric != 'Confusion':
                 print(f"{metric:>10}: {value:.4f}")
-        # Pass ga_instance to the detailed visualization function
         visualize_detailed_results(img, gt, seg, metrics, ga_instance, name)
     return metrics
 
