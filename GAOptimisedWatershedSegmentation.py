@@ -451,7 +451,7 @@ class WatershedGAOptimizer:
         ga_instance = pygad.GA(
             num_generations=CONFIG['ga_params']['generations'],
             num_parents_mating=CONFIG['ga_params']['parents_mating'],
-            fitness_func=ga_fitness_wrapper, # This now matches the required signature
+            fitness_func=ga_fitness_wrapper,
             sol_per_pop=CONFIG['ga_params']['population_size'],
             num_genes=len(gene_space),
             gene_space=gene_space,
@@ -464,17 +464,27 @@ class WatershedGAOptimizer:
 
         try:
             ga_instance.run()
+
             best_solution, best_fitness, _ = ga_instance.best_solution()
             print(f"[Result] Best solution from GA: {best_solution} with fitness: {best_fitness:.4f}")
-            # ... (Local search and final evaluation)
-            final_seg = self.decode_particle(best_solution)
+
+            # Refine the best solution with a local search
+            refined_solution, refined_fitness = local_search_refinement(best_solution, gene_space)
+
+            final_seg = self.decode_particle(refined_solution)
             final_metrics = self.evaluate_segmentation(final_seg)
             print(f"[Done] Optimization completed for {self.dataset_name}.")
-            return best_solution, final_seg, final_metrics, ga_instance
 
+            # SUCCESS PATH: Returns 4 values
+            return refined_solution, final_seg, final_metrics, ga_instance
 
+        except TimeoutException as e:
+            print(f"GA for {self.dataset_name} timed out: {e}")
+            # FAILURE PATH: Must also return 4 values
+            return None, None, None, None
         except Exception as e:
             print(f"Error during GA optimization for {self.dataset_name}: {e}")
+            # FAILURE PATH: Must also return 4 values
             return None, None, None, None
 
 
