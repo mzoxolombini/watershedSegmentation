@@ -37,7 +37,7 @@ CONFIG = {
     'ga_params': {
         'population_size': 5,
         'generations': 5,
-        'parents_mating': 2,  # CORRECTED: Must be <= population_size
+        'parents_mating': 2,
         'timeout': 14400,  # seconds
     },
     'downsample_factor': 2,
@@ -49,6 +49,31 @@ CONFIG = {
         'RF': {'n_estimators': 50, 'random_state': 42, 'n_jobs': -1},
         'SVM': {'C': 10, 'gamma': 'scale', 'kernel': 'rbf', 'probability': True},
         'KNN': {'n_neighbors': 5, 'n_jobs': -1}
+    }
+}
+
+# ================== DATASET-SPECIFIC FITNESS CONFIG ==================
+# This dictionary allows tuning the fitness function for each dataset's unique characteristics.
+DATASET_FITNESS_CONFIG = {
+    'IndianPines': {
+        'w_smoothness': 0.20,  # High penalty for fragmentation in this relatively simple scene
+        'target_regions': 1500,  # Expect fewer regions for agricultural fields
+        'min_coverage_pct': 0.10
+    },
+    'Salinas': {
+        'w_smoothness': 0.15,  # Standard penalty
+        'target_regions': 2000,  # Similar to Indian Pines
+        'min_coverage_pct': 0.10
+    },
+    'PaviaU': {
+        'w_smoothness': 0.10,  # Lower penalty, as urban scenes are naturally fragmented
+        'target_regions': 4000,  # Allow for many more regions due to complex urban objects
+        'min_coverage_pct': 0.05  # Lower coverage threshold might be needed
+    },
+    'default': {
+        'w_smoothness': 0.15,
+        'target_regions': 2000,
+        'min_coverage_pct': 0.10
     }
 }
 
@@ -223,12 +248,7 @@ def refine_predictions_by_confidence(preds_2d, proba_map, conf_thresh=0.6, dilat
 def segment_and_postprocess_hsi_using_pca_img(pca_img, gt_mask,
                                               n_comp=3, sigma=1.0, thresh=0.5,
                                               marker_min_distance=5, min_size=64, connectivity=2):
-    """
-    pca_img: (H,W,max_precomputed_components) numpy array. Use first n_comp channels.
-    gt_mask: boolean mask for area of interest
-    """
     h, w, _ = pca_img.shape
-    # intensity = first PC
     intensity = pca_img[..., 0]
     smoothed = filters.gaussian(intensity, sigma=sigma, preserve_range=True)
     gradient = filters.sobel(smoothed)
@@ -239,7 +259,6 @@ def segment_and_postprocess_hsi_using_pca_img(pca_img, gt_mask,
         if markers.max() == 0:
             raise ValueError("no markers from peak_local_max")
     except Exception:
-        # fallback: low-gradient areas as markers (percentile)
         marker_mask = np.zeros_like(gradient, dtype=bool)
         valid_vals = gradient[gt_mask]
         if valid_vals.size > 0:
@@ -289,13 +308,11 @@ def cached_decode_particle_with_pca(particle_tuple, pca_img, image, gt, classifi
         thresh = max(0.01, min(0.99, float(particle[2])))
         min_size = max(1, min(500, int(round(particle[3]))))
         classifier_idx = min(2, max(0, int(round(particle[4]))))
-        # segmentation using precomputed PCA image (take first pca_components)
         use_pca_img = pca_img[..., :pca_components]
         cleaned_labels = segment_and_postprocess_hsi_using_pca_img(
             use_pca_img, gt_mask, n_comp=pca_components, sigma=sigma, thresh=thresh,
             marker_min_distance=3, min_size=min_size, connectivity=2
         )
-        # pixel-wise predictions (use precomputed scaler & classifier probs)
         reshaped = image.reshape(-1, image.shape[-1])
         img_2d_scaled = scaler.transform(reshaped)
         clf_key = ['RF', 'SVM', 'KNN'][classifier_idx]
@@ -326,76 +343,53 @@ def cached_decode_particle_with_pca(particle_tuple, pca_img, image, gt, classifi
 GLOBAL_EVAL_ARGS = {}
 
 
-# ====== GA FITNESS WRAPPER (top-level for pickling) ========
+# ====== GA FITNESS WRAPPER (ADAPTIVE) ========
 def ga_fitness_wrapper(ga_instance, solution, solution_idx):
     """
-    Fitness function for the Genetic Algorithm, revised for robustness.
-
-    This function evaluates a given solution (a set of hyperparameters) by:
-    1.  Using Average Accuracy (AA) as the primary metric to handle class imbalance.
-    2.  Applying a spatial smoothness penalty to discourage fragmented segmentations.
-    3.  Applying a coverage penalty to avoid solutions that label too few pixels.
+    An adaptive fitness function that uses dataset-specific parameters
+    to balance accuracy, coverage, and spatial smoothness.
     """
     args = GLOBAL_EVAL_ARGS
     if not args:
         return 0.0
 
-    # --- Tunable parameters for the fitness function ---
-    # Weight for the fragmentation penalty. Higher value penalizes fragmentation more.
-    W_SMOOTHNESS = 0.15
-    # A soft target for the number of regions; solutions with more regions than this
-    # will be penalized. This value may need tuning based on dataset characteristics.
-    TARGET_REGIONS = 1500
+    # Get the specific configuration for the current dataset
+    dataset_name = args.get('dataset_name', 'default')
+    cfg = DATASET_FITNESS_CONFIG.get(dataset_name, DATASET_FITNESS_CONFIG['default'])
+
+    w_smoothness = cfg['w_smoothness']
+    target_regions = cfg['target_regions']
+    min_coverage_pct = cfg['min_coverage_pct']
 
     try:
-        # Step 1: Decode the particle and get the classification map
         class_map = cached_decode_particle_with_pca(
             tuple(solution),
-            args['pca_img'],
-            args['image'],
-            args['gt'],
-            args['classifiers'],
-            args['scaler'],
-            args['gt_mask'],
-            args['h'],
-            args['w'],
-            conf_thresh=args['conf_thresh'],
-            dilation_radius=args['dilation_radius']
+            args['pca_img'], args['image'], args['gt'], args['classifiers'],
+            args['scaler'], args['gt_mask'], args['h'], args['w'],
+            conf_thresh=CONFIG['watershed_params']['conf_thresh'],
+            dilation_radius=CONFIG['watershed_params']['dilation_radius']
         )
-
-        # Step 2: Evaluate the classification map to get performance metrics
         metrics = evaluate(args['gt'], class_map)
-
-        # Use Average Accuracy (AA) as the primary fitness score to handle class imbalance
         base_fitness = metrics.get('AA', 0.0)
 
-        # --- Penalty Calculations ---
-
-        # Penalty 1: Low Coverage
-        # Penalize if the solution labels too little of the ground truth area.
+        # --- Penalty Calculations with dataset-specific parameters ---
+        # Coverage Penalty
         labeled_pixel_count = np.count_nonzero(class_map)
         total_pixels_in_gt = np.count_nonzero(args['gt_mask'])
         coverage_ratio = labeled_pixel_count / total_pixels_in_gt if total_pixels_in_gt > 0 else 0
 
         coverage_penalty = 0.0
-        if coverage_ratio < 0.10:  # Penalize if less than 10% of the ground truth area is labeled
-            # The penalty increases linearly as the coverage ratio drops from 10% to 0%
-            coverage_penalty = 0.3 * (1 - coverage_ratio / 0.10)
+        if coverage_ratio < min_coverage_pct:
+            coverage_penalty = 0.3 * (1 - coverage_ratio / min_coverage_pct)
 
-        # Penalty 2: Spatial Smoothness (Fragmentation)
-        # Penalize solutions that result in a very high number of small regions.
-        num_regions = len(np.unique(class_map)) - 1  # Subtract 1 for the background label (0)
-
+        # Smoothness Penalty
+        num_regions = len(np.unique(class_map)) - 1
         smoothness_penalty = 0.0
-        if num_regions > TARGET_REGIONS:
-            # Penalize based on how much the number of regions exceeds the target
-            excess_ratio = (num_regions - TARGET_REGIONS) / TARGET_REGIONS
-            smoothness_penalty = W_SMOOTHNESS * excess_ratio
+        if num_regions > target_regions:
+            excess_ratio = (num_regions - target_regions) / target_regions
+            smoothness_penalty = w_smoothness * excess_ratio
 
-        # Step 3: Combine base fitness with penalties
         final_fitness = base_fitness - coverage_penalty - smoothness_penalty
-
-        # Ensure fitness is non-negative
         return max(0.0, final_fitness)
 
     except Exception as e:
@@ -406,20 +400,18 @@ def ga_fitness_wrapper(ga_instance, solution, solution_idx):
 # ================== OPTIMIZED WATERSHED GA ==================
 class WatershedGAOptimizer:
     def __init__(self, image, ground_truth, dataset_name):
-        print("[Init] Initializing GA optimizer and precomputations...")
+        print(f"[Init] Initializing GA optimizer for {dataset_name}...")
         self.image = image
         self.gt = ground_truth
         self.dataset_name = dataset_name
         self.gt_mask = self.gt > 0
         self.h, self.w = self.gt.shape
         self.b = self.image.shape[2]
-        # Precompute PCA up to 10 components (or b)
         max_comp = min(10, self.b)
         reshaped = self.image.reshape(-1, self.b)
         self.pca_model = PCA(n_components=max_comp)
         pca_flat = self.pca_model.fit_transform(reshaped)
         self.pca_img = pca_flat.reshape(self.h, self.w, max_comp)
-        # scaler and classifier precomputations
         self.scaler = StandardScaler()
         img_2d = self.image.reshape(-1, self.b)
         self.img_2d_scaled = self.scaler.fit_transform(img_2d)
@@ -427,7 +419,6 @@ class WatershedGAOptimizer:
         mask = gt_flat > 0
         y = gt_flat[mask].astype(int) - 1
         X = self.img_2d_scaled[mask]
-        # classifiers
         self.classifiers = {
             'RF': RandomForestClassifier(**CONFIG['classifiers']['RF']),
             'SVM': SVC(**CONFIG['classifiers']['SVM']),
@@ -447,10 +438,6 @@ class WatershedGAOptimizer:
         return evaluate(self.gt, class_map)
 
     def optimize(self):
-        """
-        Run the Genetic Algorithm optimization for watershed segmentation
-        on the specified dataset.
-        """
         print(f"[Optimize] Starting GA for {self.dataset_name} dataset...")
         global GLOBAL_EVAL_ARGS
         GLOBAL_EVAL_ARGS = {
@@ -462,8 +449,7 @@ class WatershedGAOptimizer:
             'gt_mask': self.gt_mask,
             'h': self.h,
             'w': self.w,
-            'conf_thresh': CONFIG['watershed_params']['conf_thresh'],
-            'dilation_radius': CONFIG['watershed_params']['dilation_radius']
+            'dataset_name': self.dataset_name  # Pass dataset name to fitness function
         }
 
         ga_instance = pygad.GA(
@@ -473,11 +459,11 @@ class WatershedGAOptimizer:
             sol_per_pop=CONFIG['ga_params']['population_size'],
             num_genes=5,
             gene_space=[
-                {'low': 1, 'high': self.pca_img.shape[2], 'step': 1},  # pca_components
-                {'low': 0.1, 'high': 5},  # sigma
-                {'low': 0.01, 'high': 0.99},  # thresh
-                {'low': 1, 'high': 500, 'step': 1},  # min_size
-                {'low': 0, 'high': 2, 'step': 1}  # classifier_idx
+                {'low': 1, 'high': self.pca_img.shape[2], 'step': 1},
+                {'low': 0.1, 'high': 5},
+                {'low': 0.01, 'high': 0.99},
+                {'low': 1, 'high': 500, 'step': 1},
+                {'low': 0, 'high': 2, 'step': 1}
             ],
             parent_selection_type="sss",
             crossover_type="single_point",
@@ -493,10 +479,8 @@ class WatershedGAOptimizer:
             best_solution, best_solution_fitness, _ = ga_instance.best_solution()
             print(
                 f"[Result] Best solution for {self.dataset_name}: {best_solution} with fitness: {best_solution_fitness}")
-
             final_seg = self.decode_particle(best_solution)
             final_metrics = self.evaluate_segmentation(final_seg)
-
             print(f"[Done] Optimization completed for {self.dataset_name}.")
             return best_solution, final_seg, final_metrics
 
