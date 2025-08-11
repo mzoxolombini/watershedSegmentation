@@ -29,6 +29,14 @@ from joblib import Memory
 import multiprocessing
 
 import pygad
+import matplotlib
+# Try to use Qt backend if available, otherwise use TkAgg
+try:
+    import PyQt5
+    matplotlib.use('Qt5Agg')  # Use Qt backend if available
+except ImportError:
+    matplotlib.use('TkAgg')  # Fall back to Tkinter backend
+import matplotlib.pyplot as plt
 
 memory = Memory(location='cache_dir', verbose=0)
 
@@ -511,7 +519,10 @@ class WatershedGAOptimizer:
 
 # ================== VISUALIZATION ==================
 def visualize_results(img, gt, segmentation, metrics):
+    # Create figure without blocking
     plt.figure(figsize=(15, 5))
+
+    # RGB Composite
     plt.subplot(131)
     if img.shape[2] > 3:
         pca = PCA(n_components=3)
@@ -523,11 +534,13 @@ def visualize_results(img, gt, segmentation, metrics):
     plt.title('RGB Composite')
     plt.axis('off')
 
+    # Ground Truth
     plt.subplot(132)
     plt.imshow(gt, cmap='nipy_spectral')
     plt.title('Ground Truth')
     plt.axis('off')
 
+    # Segmentation Results
     plt.subplot(133)
     plt.imshow(segmentation, cmap='nipy_spectral')
     title = (f"Segmentation Results\nOA: {metrics['OA']:.3f}, Kappa: {metrics['Kappa']:.3f}\n"
@@ -536,8 +549,14 @@ def visualize_results(img, gt, segmentation, metrics):
     plt.axis('off')
 
     plt.tight_layout()
-    plt.show(block=False)  # Non-blocking show
-    plt.pause(0.1)
+
+    # Proper display method
+    try:
+        plt.show(block=False)
+        plt.pause(3)  # Display for 3 seconds
+    except:
+        plt.show(block=True)  # Fallback if non-interactive
+    plt.close()
 
 
 # ================== MAIN PIPELINE ==================
