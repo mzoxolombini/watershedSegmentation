@@ -10,8 +10,7 @@ import threading
 from contextlib import contextmanager
 import numpy as np
 import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+matplotlib.use('Qt5Agg')
 import seaborn as sns
 from scipy.io import loadmat
 from skimage.transform import resize
@@ -29,13 +28,13 @@ from joblib import Memory
 import multiprocessing
 
 import pygad
-import matplotlib
-# Try to use Qt backend if available, otherwise use TkAgg
+
 try:
     import PyQt5
-    matplotlib.use('Qt5Agg')  # Use Qt backend if available
+    matplotlib.use('Qt5Agg')  # Use Qt backend
 except ImportError:
-    matplotlib.use('TkAgg')  # Fall back to Tkinter backend
+    matplotlib.use('Agg')  # Fall back to non-interactive backend
+    print("PyQt5 not found - plots will not be interactive")
 import matplotlib.pyplot as plt
 
 memory = Memory(location='cache_dir', verbose=0)
@@ -519,44 +518,54 @@ class WatershedGAOptimizer:
 
 # ================== VISUALIZATION ==================
 def visualize_results(img, gt, segmentation, metrics):
-    # Create figure without blocking
-    plt.figure(figsize=(15, 5))
+    # Create a new figure
+    fig = plt.figure(figsize=(15, 5), num='Hyperspectral Segmentation Results')
 
-    # RGB Composite
-    plt.subplot(131)
+    # RGB Composite subplot
+    ax1 = plt.subplot(131)
     if img.shape[2] > 3:
         pca = PCA(n_components=3)
         img_rgb = pca.fit_transform(img.reshape(-1, img.shape[2])).reshape(img.shape[0], img.shape[1], 3)
         img_rgb = exposure.rescale_intensity(img_rgb, in_range='image', out_range=(0, 1))
     else:
         img_rgb = img
-    plt.imshow(img_rgb)
-    plt.title('RGB Composite')
-    plt.axis('off')
+    ax1.imshow(img_rgb)
+    ax1.set_title('RGB Composite')
+    ax1.axis('off')
 
-    # Ground Truth
-    plt.subplot(132)
-    plt.imshow(gt, cmap='nipy_spectral')
-    plt.title('Ground Truth')
-    plt.axis('off')
+    # Ground Truth subplot
+    ax2 = plt.subplot(132)
+    ax2.imshow(gt, cmap='nipy_spectral')
+    ax2.set_title('Ground Truth')
+    ax2.axis('off')
 
-    # Segmentation Results
-    plt.subplot(133)
-    plt.imshow(segmentation, cmap='nipy_spectral')
+    # Segmentation Results subplot
+    ax3 = plt.subplot(133)
+    im = ax3.imshow(segmentation, cmap='nipy_spectral')
     title = (f"Segmentation Results\nOA: {metrics['OA']:.3f}, Kappa: {metrics['Kappa']:.3f}\n"
              f"Dice: {metrics['Dice']:.3f}, IoU: {metrics['IoU']:.3f}")
-    plt.title(title)
-    plt.axis('off')
+    ax3.set_title(title)
+    ax3.axis('off')
 
     plt.tight_layout()
 
-    # Proper display method
-    try:
-        plt.show(block=False)
-        plt.pause(3)  # Display for 3 seconds
-    except:
-        plt.show(block=True)  # Fallback if non-interactive
-    plt.close()
+    # Check if we're using an interactive backend
+    if matplotlib.get_backend().lower() != 'agg':
+        try:
+            plt.show(block=False)
+            plt.pause(0.1)  # Allow time for the window to appear
+            print("Close the plot window to continue...")
+            while plt.fignum_exists(fig.number):
+                plt.pause(0.5)  # Keep the window open
+        except:
+            plt.show(block=True)  # Fallback if non-interactive
+    else:
+        # Save to file if not interactive
+        output_path = f"{name}_results.png"
+        plt.savefig(output_path)
+        print(f"Results saved to {output_path}")
+
+    plt.close(fig)
 
 
 # ================== MAIN PIPELINE ==================
@@ -575,7 +584,6 @@ def process_dataset(name, config):
                 if metric != 'Confusion':
                     print(f"{metric:>10}: {value:.4f}")
             visualize_results(img, gt, seg, metrics)
-            plt.close('all')  # Clean up figures
         return metrics
     except Exception as e:
         print(f"Error processing {name}: {str(e)}")
