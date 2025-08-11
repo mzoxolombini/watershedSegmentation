@@ -605,7 +605,7 @@ if __name__ == "__main__":
         for name, metrics in results.items():
             if metrics:
                 print(
-                    f"{name:<12} {metrics['OA']:8.4f} {metrics['AA']:8.4f} {metrics['Kappa']:8.4f} {metrics['Dice']:8.4f} {metrics['IoU']:8.f}")
+                    f"{name:<12} {metrics['OA']:8.4f} {metrics['AA']:8.4f} {metrics['Kappa']:8.4f} {metrics['Dice']:8.4f} {metrics['IoU']:8.4f}")
     try:
         shutil.rmtree(CACHE_DIR)
     except OSError as e:
