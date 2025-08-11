@@ -9,6 +9,8 @@ import socket
 import threading
 from contextlib import contextmanager
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.io import loadmat
@@ -24,6 +26,7 @@ from skimage.feature import peak_local_max
 from scipy import ndimage as ndi
 from skimage.morphology import disk, binary_dilation
 from joblib import Memory
+import multiprocessing
 
 import pygad
 
@@ -519,39 +522,49 @@ def visualize_results(img, gt, segmentation, metrics):
     plt.imshow(img_rgb)
     plt.title('RGB Composite')
     plt.axis('off')
+
     plt.subplot(132)
     plt.imshow(gt, cmap='nipy_spectral')
     plt.title('Ground Truth')
     plt.axis('off')
+
     plt.subplot(133)
     plt.imshow(segmentation, cmap='nipy_spectral')
     title = (f"Segmentation Results\nOA: {metrics['OA']:.3f}, Kappa: {metrics['Kappa']:.3f}\n"
              f"Dice: {metrics['Dice']:.3f}, IoU: {metrics['IoU']:.3f}")
     plt.title(title)
     plt.axis('off')
+
     plt.tight_layout()
-    plt.show()
+    plt.show(block=False)  # Non-blocking show
+    plt.pause(0.1)
 
 
 # ================== MAIN PIPELINE ==================
 def process_dataset(name, config):
-    print(f"\nProcessing {name} dataset (downsampled by {config['downsample_factor']}x)")
-    img, gt = load_dataset(name, downsample_factor=config['downsample_factor'])
-    img = (img - img.min()) / (img.max() - img.min())
-    optimizer = WatershedGAOptimizer(img, gt, name)
+    try:
+        print(f"\nProcessing {name} dataset (downsampled by {config['downsample_factor']}x)")
+        img, gt = load_dataset(name, downsample_factor=config['downsample_factor'])
+        img = (img - img.min()) / (img.max() - img.min())
+        optimizer = WatershedGAOptimizer(img, gt, name)
 
-    params, seg, metrics, ga_instance = optimizer.optimize()
+        params, seg, metrics, ga_instance = optimizer.optimize()
 
-    if metrics:
-        print("\nPerformance Metrics:")
-        for metric, value in metrics.items():
-            if metric != 'Confusion':
-                print(f"{metric:>10}: {value:.4f}")
-        visualize_results(img, gt, seg, metrics)
-    return metrics
+        if metrics:
+            print("\nPerformance Metrics:")
+            for metric, value in metrics.items():
+                if metric != 'Confusion':
+                    print(f"{metric:>10}: {value:.4f}")
+            visualize_results(img, gt, seg, metrics)
+            plt.close('all')  # Clean up figures
+        return metrics
+    except Exception as e:
+        print(f"Error processing {name}: {str(e)}")
+        return None
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     results = {}
     for name in CONFIG['datasets']:
         try:
